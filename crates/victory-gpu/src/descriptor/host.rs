@@ -1049,6 +1049,62 @@ mod tests {
         assert_eq!(cut_to_copy(0, u32::MAX, 4096), Some(4096), "cut to the whole copy");
     }
 
+    /// [`views_are_cut_to_their_host_copy`] through the heap: a buffer view
+    /// past its host copy makes a null slot, one running past it is kept and
+    /// cut, and the device stays alive (both are invalid calls the host
+    /// removes the device for).
+    #[test]
+    fn a_buffer_view_past_its_host_copy_is_null_and_one_running_past_it_is_cut() {
+        let Some(host) = host() else {
+            return; // no host GPU
+        };
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return;
+        };
+        // A title buffer whose view's memory it holds; its host copy is 64 KiB
+        // (padded), so 4,096 elements of 16 bytes.
+        let (address, len) = (0x7e00_2000_0000_u64, 0x1000_u64);
+        crate::shadow::register(usize::MAX - 2, address, len);
+        let mut resource = [0u32; 14];
+        resource[0] = 1; // a buffer
+        resource[4] = len as u32;
+        let placed = |unordered: bool, first: u64, elements: u32| {
+            let mut desc = [0u32; 16];
+            desc[1] = 1; // buffer dimension
+            if unordered {
+                // FirstElement, NumElements, StructureByteStride
+                (desc[2], desc[3]) = (first as u32, (first >> 32) as u32);
+                (desc[4], desc[5]) = (elements, 16);
+            } else {
+                // The union is 8-byte aligned, so a shader resource view's
+                // buffer starts a word later than an unordered access one's.
+                desc[2] = D3D12_DEFAULT_SHADER_4_COMPONENT_MAPPING;
+                (desc[4], desc[5]) = (first as u32, (first >> 32) as u32);
+                (desc[6], desc[7]) = (elements, 16);
+            }
+            (desc[10], desc[11]) = (address as u32, (address >> 32) as u32);
+            View::Placed(unordered, resource, desc)
+        };
+        let kept = |index: u32| heap.kept.lock().unwrap()[index as usize].is_some();
+        for unordered in [false, true] {
+            // The first element past the copy: no slot to read.
+            heap.make_at(0, &placed(unordered, 4096, 1));
+            assert!(!kept(0), "a view past the copy (unordered: {unordered})");
+            // The last element, and one whose last element runs past it.
+            heap.make_at(1, &placed(unordered, 4095, 1));
+            assert!(kept(1), "the copy's last element (unordered: {unordered})");
+            heap.make_at(2, &placed(unordered, 4095, 4));
+            assert!(kept(2), "a view cut to its copy (unordered: {unordered})");
+            // SAFETY: a plain device query.
+            let removed = unsafe { host.device.GetDeviceRemovedReason() };
+            assert!(
+                removed.is_ok(),
+                "device removed: {removed:?} (unordered: {unordered})"
+            );
+        }
+        crate::shadow::unregister(usize::MAX - 2, address);
+    }
+
     /// Dynamic slots stay taken until given back, and runs do not wrap.
     #[test]
     fn dynamic_slots_are_held_until_released() {
