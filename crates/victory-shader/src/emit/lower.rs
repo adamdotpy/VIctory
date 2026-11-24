@@ -342,6 +342,22 @@ fn unsupported(offset: usize, what: Why) -> Stop {
     Stop::Fail(ShaderError::Unsupported { offset, what })
 }
 
+/// Why dword `rel` of a GFX10 image (`image`) or buffer descriptor has no
+/// value when the program reads it as a number: what the dword holds.
+/// `None` past the descriptor.
+fn descriptor_field(image: bool, rel: u32) -> Option<Why> {
+    Some(match (image, rel) {
+        (true, 0) => "an image descriptor's address read as data",
+        (true, 5) => "an image descriptor's array pitch or mip limits read as data",
+        (true, 6) => "an image descriptor's compression fields read as data",
+        (true, 7) => "an image descriptor's metadata address read as data",
+        (false, 0) => "a buffer descriptor's address read as data",
+        (false, 1) => "a buffer descriptor's stride or high address read as data",
+        (false, 3) => "a buffer descriptor's format or swizzle read as data",
+        _ => return None,
+    })
+}
+
 /// Why a scalar memory instruction other than a load of dwords has no
 /// value here, named by what it is.
 fn smem_reason(name: &str) -> Why {
@@ -3129,7 +3145,8 @@ impl<'a> Lower<'a> {
                 Some(&(_, x)) => self.write(inst, Reg::S(code + k as u8), x, None),
                 None => {
                     if let Some(v) = inst.write(Reg::S(code + k as u8)) {
-                        self.vals.insert(v, Val::Missing(OTHER));
+                        let why = descriptor_field(image.is_some(), rel).unwrap_or(OTHER);
+                        self.vals.insert(v, Val::Missing(why));
                     }
                 }
             }
@@ -7653,6 +7670,85 @@ mod tests {
             )),
             Some("a descriptor read only as data")
         );
+    }
+
+    #[test]
+    fn descriptor_dwords_read_as_data_name_what_they_hold() {
+        // An image descriptor that a sample uses and a buffer descriptor
+        // that a load uses, one dword of each stored as a number. Dwords
+        // the translation rebuilds from the host view translate.
+        let image = |sgpr: u32| {
+            vec![
+                0xBE82_0300, // s_mov_b32 s2, s0
+                0xBE83_0380, // s_mov_b32 s3, 0
+                0xF40C_0301,
+                0xFA00_0000, // s_load_dwordx8 s[12:19], s[2:3], null
+                0xBE84_0301, // s_mov_b32 s4, s1
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+                0x7E04_0280, // v_mov_b32 v2, 0
+                0x7E06_0280, // v_mov_b32 v3, 0
+                0xF09C_0F08,
+                0x0043_0C02, // image_sample_lz v[12:15], v[2:3], s[12:19], s[8:11] dmask:0xf dim:2D
+                0x7E02_0200 | sgpr, // v_mov_b32 v1, s<sgpr>
+                0xD834_0000,
+                0x0000_0100, // ds_write_b32 v0, v1
+                S_ENDPGM,
+            ]
+        };
+        assert_eq!(names(&image(12))[8], "image_sample_lz");
+        for (dword, want) in [
+            (0, Some("an image descriptor's address read as data")),
+            (2, None),
+            (
+                5,
+                Some("an image descriptor's array pitch or mip limits read as data"),
+            ),
+            (
+                6,
+                Some("an image descriptor's compression fields read as data"),
+            ),
+            (
+                7,
+                Some("an image descriptor's metadata address read as data"),
+            ),
+        ] {
+            let (layout, used) = texture_tables();
+            let got = refusal(lower_with(&image(12 + dword), layout, used));
+            assert_eq!(got, want, "image dword {dword}");
+        }
+        let buffer = |sgpr: u32| {
+            vec![
+                0xBE84_0300, // s_mov_b32 s4, s0
+                0xBE85_0380, // s_mov_b32 s5, 0
+                0xF408_0202,
+                0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], null
+                0xE030_0000,
+                0x8002_0100,        // buffer_load_dword v1, off, s[8:11], 0
+                0x7E02_0200 | sgpr, // v_mov_b32 v1, s<sgpr>
+                0xD834_0000,
+                0x0000_0100, // ds_write_b32 v0, v1
+                S_ENDPGM,
+            ]
+        };
+        assert_eq!(names(&buffer(8))[3], "buffer_load_dword");
+        for (dword, want) in [
+            (0, Some("a buffer descriptor's address read as data")),
+            (
+                1,
+                Some("a buffer descriptor's stride or high address read as data"),
+            ),
+            (2, None),
+            (
+                3,
+                Some("a buffer descriptor's format or swizzle read as data"),
+            ),
+        ] {
+            let (layout, used) = buffer_table(ResourceType::Srv, 0);
+            let got = refusal(lower_with(&buffer(8 + dword), layout, used));
+            assert_eq!(got, want, "buffer dword {dword}");
+        }
     }
 
     #[test]
