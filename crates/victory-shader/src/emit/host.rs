@@ -918,6 +918,8 @@ pub enum View<'a> {
     TextureUav(u32, u32),
     /// An R32_UINT texture UAV (width, height), zeroed (atomics).
     UintTextureUav(u32, u32),
+    /// An R32G32_UINT texture UAV (width, height), zeroed (64-bit atomics).
+    Uint2TextureUav(u32, u32),
     /// A typed RGBA16F buffer UAV of this many elements, zeroed.
     HalfUav(u32),
     /// A constant buffer of these dwords.
@@ -1019,19 +1021,17 @@ impl Host {
                 ..Default::default()
             };
             // Texel words: 4 for RGBA32F, 1 for R32_UINT.
-            let footprint_as =
-                |r: &ID3D12Resource, w: u32, h: u32, words: u32| D3D12_TEXTURE_COPY_LOCATION {
+            // A buffer laid out as a texture of `words` dwords per texel in
+            // `format` (the texture's own, for copies from it).
+            let footprint_in = |r: &ID3D12Resource, w: u32, h: u32, words: u32, format| {
+                D3D12_TEXTURE_COPY_LOCATION {
                     pResource: std::mem::transmute_copy(r),
                     Type: D3D12_TEXTURE_COPY_TYPE_PLACED_FOOTPRINT,
                     Anonymous: D3D12_TEXTURE_COPY_LOCATION_0 {
                         PlacedFootprint: D3D12_PLACED_SUBRESOURCE_FOOTPRINT {
                             Offset: 0,
                             Footprint: D3D12_SUBRESOURCE_FOOTPRINT {
-                                Format: if words == 1 {
-                                    DXGI_FORMAT_R32_UINT
-                                } else {
-                                    DXGI_FORMAT_R32G32B32A32_FLOAT
-                                },
+                                Format: format,
                                 Width: w,
                                 Height: h,
                                 Depth: 1,
@@ -1039,8 +1039,11 @@ impl Host {
                             },
                         },
                     },
-                };
-            let footprint = |r: &ID3D12Resource, w: u32, h: u32| footprint_as(r, w, h, 4);
+                }
+            };
+            let footprint = |r: &ID3D12Resource, w: u32, h: u32| {
+                footprint_in(r, w, h, 4, DXGI_FORMAT_R32G32B32A32_FLOAT)
+            };
             let subresource = |r: &ID3D12Resource| D3D12_TEXTURE_COPY_LOCATION {
                 pResource: std::mem::transmute_copy(r),
                 Type: D3D12_TEXTURE_COPY_TYPE_SUBRESOURCE_INDEX,
@@ -1226,6 +1229,26 @@ impl Host {
                         )?;
                         uavs.push((t, Some((w, h)), 1, rb));
                     }
+                    View::Uint2TextureUav(w, h) => {
+                        let t = make(
+                            D3D12_HEAP_TYPE_DEFAULT,
+                            &texture_as(
+                                w,
+                                h,
+                                D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS,
+                                DXGI_FORMAT_R32G32_UINT,
+                            ),
+                            D3D12_RESOURCE_STATE_UNORDERED_ACCESS,
+                        )?;
+                        dev.CreateUnorderedAccessView(&t, None, None, at);
+                        let pitch = (w * 8).next_multiple_of(256);
+                        let rb = make(
+                            D3D12_HEAP_TYPE_READBACK,
+                            &buffer(u64::from(pitch * h), D3D12_RESOURCE_FLAG_NONE),
+                            D3D12_RESOURCE_STATE_COPY_DEST,
+                        )?;
+                        uavs.push((t, Some((w, h)), 2, rb));
+                    }
                     View::Cbv(data) => {
                         let b = upload(data)?;
                         dev.CreateConstantBufferView(
@@ -1331,7 +1354,7 @@ impl Host {
                 )]);
                 match size {
                     Some((w, h)) => list.CopyTextureRegion(
-                        &footprint_as(rb, *w, *h, *n),
+                        &footprint_in(rb, *w, *h, *n, r.GetDesc().Format),
                         0,
                         0,
                         0,
